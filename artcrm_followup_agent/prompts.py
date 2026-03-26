@@ -49,6 +49,7 @@ def draft_reply_prompt(mission: AgentMission, contact: dict, message: dict, lang
         f"The reply should:\n"
         f"- Acknowledge their interest warmly\n"
         f"- Propose a concrete next step (visit, video call, sending portfolio)\n"
+        f"- Sign off with your name and website: {mission.website}\n"
         f'- End with this opt-out line (verbatim): "{opt_out}"\n\n'
         f"Return JSON: {{\"subject\": \"...\", \"body\": \"...\"}}\n"
         f"Return ONLY the JSON object, no other text."
@@ -78,6 +79,7 @@ def draft_followup_prompt(
         f"- Be 2-3 sentences only — brief and light\n"
         f"- Not feel like pressure or a reminder\n"
         f"- Offer a natural out if they're not interested\n"
+        f"- Sign off with your name and website: {mission.website}\n"
         f'- End with this opt-out line (verbatim): "{opt_out}"\n\n'
         f"Return JSON: {{\"subject\": \"...\", \"body\": \"...\"}}\n"
         f"Return ONLY the JSON object, no other text."
