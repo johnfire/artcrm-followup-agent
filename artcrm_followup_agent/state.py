@@ -18,5 +18,6 @@ class FollowupState(TypedDict):
 
     # --- output ---
     sent_count: int
+    queued_count: int
     opt_out_count: int
     summary: str

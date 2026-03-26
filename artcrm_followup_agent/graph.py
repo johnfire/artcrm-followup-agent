@@ -4,7 +4,7 @@ from langgraph.graph import StateGraph, END
 from .protocols import (
     AgentMission, LanguageModel, InboxFetcher, ContactMatcher,
     InteractionLogger, OptOutSetter, InboxMessageMarker,
-    OverdueFetcher, EmailSender, RunStarter, RunFinisher,
+    OverdueFetcher, EmailSender, ApprovalQueuer, RunStarter, RunFinisher,
 )
 from .state import FollowupState
 from .prompts import classify_reply_prompt, draft_reply_prompt, draft_followup_prompt
@@ -20,6 +20,7 @@ def create_followup_agent(
     mark_message_processed: InboxMessageMarker,
     fetch_overdue: OverdueFetcher,
     send_email: EmailSender,
+    queue_for_approval: ApprovalQueuer,
     start_run: RunStarter,
     finish_run: RunFinisher,
     mission: AgentMission,
@@ -29,13 +30,11 @@ def create_followup_agent(
     Build and return a compiled LangGraph follow-up agent.
 
     Processes two work streams per run:
-      1. Inbox replies — classifies each, logs interactions, flags opt-outs,
-         and drafts replies for interested contacts.
-      2. Overdue contacts — finds contacts with no reply after `overdue_days`
-         and drafts brief follow-up emails.
-
-    All drafted emails are sent autonomously. A daily report (visible at
-    /activity/ in the supervisor UI) is the human checkpoint.
+      1. Inbox replies — reads unread emails, skips any that don't match a known
+         contact, classifies the rest, logs interactions, flags opt-outs, and
+         sends replies autonomously for interested contacts.
+      2. Overdue contacts — finds contacted contacts with no reply after
+         `overdue_days` days and queues a brief nudge for human approval.
 
     Usage:
         agent = create_followup_agent(llm=..., ...)
@@ -53,6 +52,7 @@ def create_followup_agent(
             "emails_to_send": [],
             "errors": [],
             "sent_count": 0,
+            "queued_count": 0,
             "opt_out_count": 0,
             "summary": "",
         }
@@ -68,9 +68,10 @@ def create_followup_agent(
         """
         For each inbox message:
         - Try to match to a contact by sender email
+        - Skip (mark processed) if no match — it's not one of our contacts
         - Classify the reply with the LLM
         - If opt_out: flag immediately
-        - If interested: draft a reply
+        - If interested: draft a reply and send autonomously
         - Log the interaction regardless
         - Mark message as processed
         """
@@ -84,6 +85,15 @@ def create_followup_agent(
                 contact = match_contact(msg["from_email"])
             except Exception:
                 pass
+
+            # Not one of our contacts — mark processed and skip entirely
+            # Don't waste LLM tokens classifying newsletters or personal email
+            if contact is None:
+                try:
+                    mark_message_processed(msg["id"], None)
+                except Exception:
+                    pass
+                continue
 
             # Classify the reply
             system, user = classify_reply_prompt(mission, msg)
@@ -100,41 +110,41 @@ def create_followup_agent(
 
             entry = {
                 "inbox_message_id": msg["id"],
-                "contact_id": contact["id"] if contact else None,
+                "contact_id": contact["id"],
                 "from_email": msg["from_email"],
                 "classification": classification,
                 "reasoning": reasoning,
             }
 
             # Handle opt-out immediately
-            if classification == "opt_out" and contact:
+            if classification == "opt_out":
                 try:
                     set_opt_out(contact["id"])
                     opt_out_count += 1
                 except Exception as e:
                     entry["error"] = f"set_opt_out: {e}"
 
-            # Log the interaction if we matched a contact
-            if contact:
-                outcome_map = {
-                    "interested": "interested",
-                    "rejected": "rejected",
-                    "opt_out": "no_reply",
-                    "other": "no_reply",
-                }
-                try:
-                    log_interaction(
-                        contact_id=contact["id"],
-                        method="email",
-                        direction="inbound",
-                        summary=f"{classification}: {msg.get('subject', '')}",
-                        outcome=outcome_map.get(classification, "no_reply"),
-                    )
-                except Exception:
-                    pass
+            # Log the interaction
+            outcome_map = {
+                "interested": "interested",
+                "rejected": "rejected",
+                "opt_out": "no_reply",
+                "other": "no_reply",
+            }
+            try:
+                log_interaction(
+                    contact_id=contact["id"],
+                    method="email",
+                    direction="inbound",
+                    summary=f"{classification}: {msg.get('subject', '')}",
+                    outcome=outcome_map.get(classification, "no_reply"),
+                )
+            except Exception:
+                pass
 
-            # Draft a reply for interested contacts
-            if classification == "interested" and contact and contact.get("email"):
+            # Draft and send a reply for interested contacts
+            # These are time-sensitive — someone just said yes — so send autonomously
+            if classification == "interested" and contact.get("email"):
                 language = contact.get("preferred_language") or mission.language_default
                 sys_p, usr_p = draft_reply_prompt(mission, contact, msg, language)
                 try:
@@ -153,7 +163,7 @@ def create_followup_agent(
 
             # Mark the inbox message as processed
             try:
-                mark_message_processed(msg["id"], contact["id"] if contact else None)
+                mark_message_processed(msg["id"], contact["id"])
             except Exception:
                 pass
 
@@ -172,8 +182,13 @@ def create_followup_agent(
             return {"errors": state["errors"] + [f"fetch_overdue: {e}"], "overdue_contacts": []}
         return {"overdue_contacts": overdue}
 
-    def draft_followup_emails(state: FollowupState) -> dict:
-        emails_to_send = list(state.get("emails_to_send", []))
+    def queue_followup_drafts(state: FollowupState) -> dict:
+        """
+        Draft follow-up nudges for overdue contacts and put them in the
+        approval queue — not sent autonomously. You review and approve.
+        """
+        run_id = state.get("run_id", 0)
+        queued = 0
         for contact in state.get("overdue_contacts", []):
             if not contact.get("email"):
                 continue
@@ -184,18 +199,19 @@ def create_followup_agent(
             try:
                 response = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
                 draft = parse_json_response(response.content)
-                emails_to_send.append({
-                    "contact_id": contact["id"],
-                    "to_email": contact["email"],
-                    "subject": draft.get("subject", ""),
-                    "body": draft.get("body", ""),
-                    "type": "followup",
-                })
+                queue_for_approval(
+                    contact_id=contact["id"],
+                    run_id=run_id,
+                    subject=draft.get("subject", ""),
+                    body=draft.get("body", ""),
+                )
+                queued += 1
             except Exception:
-                pass  # individual draft failures don't stop the run
-        return {"emails_to_send": emails_to_send}
+                pass
+        return {"queued_count": queued}
 
     def send_all_emails(state: FollowupState) -> dict:
+        """Send replies to interested contacts. Overdue nudges go through approval instead."""
         sent = 0
         for email in state.get("emails_to_send", []):
             if not email.get("to_email") or not email.get("body"):
@@ -211,7 +227,7 @@ def create_followup_agent(
                         contact_id=email["contact_id"],
                         method="email",
                         direction="outbound",
-                        summary=email.get("subject", "follow-up sent"),
+                        summary=email.get("subject", "reply sent"),
                         outcome="no_reply",
                     )
                 if success:
@@ -221,16 +237,18 @@ def create_followup_agent(
         return {"sent_count": sent}
 
     def generate_report(state: FollowupState) -> dict:
-        inbox_count = len(state.get("inbox_messages", []))
+        inbox_count = len(state.get("classified_replies", []))
         overdue_count = len(state.get("overdue_contacts", []))
         sent = state.get("sent_count", 0)
+        queued = state.get("queued_count", 0)
         opt_outs = state.get("opt_out_count", 0)
         errs = state.get("errors", [])
 
         summary = (
-            f"followup_agent: {inbox_count} inbox messages processed, "
+            f"followup_agent: {inbox_count} replies processed, "
             f"{overdue_count} overdue contacts, "
-            f"{sent} emails sent, {opt_outs} opt-outs recorded"
+            f"{sent} replies sent, {queued} follow-ups queued for approval, "
+            f"{opt_outs} opt-outs recorded"
         )
         if errs:
             summary += f", {len(errs)} error(s)"
@@ -243,6 +261,7 @@ def create_followup_agent(
                 "inbox_processed": inbox_count,
                 "overdue_handled": overdue_count,
                 "sent": sent,
+                "queued": queued,
                 "opt_outs": opt_outs,
             },
         )
@@ -253,7 +272,7 @@ def create_followup_agent(
     graph.add_node("fetch_inbox_messages", fetch_inbox_messages)
     graph.add_node("classify_replies", classify_replies)
     graph.add_node("fetch_overdue_contacts", fetch_overdue_contacts)
-    graph.add_node("draft_followup_emails", draft_followup_emails)
+    graph.add_node("queue_followup_drafts", queue_followup_drafts)
     graph.add_node("send_all_emails", send_all_emails)
     graph.add_node("generate_report", generate_report)
 
@@ -261,8 +280,8 @@ def create_followup_agent(
     graph.add_edge("init", "fetch_inbox_messages")
     graph.add_edge("fetch_inbox_messages", "classify_replies")
     graph.add_edge("classify_replies", "fetch_overdue_contacts")
-    graph.add_edge("fetch_overdue_contacts", "draft_followup_emails")
-    graph.add_edge("draft_followup_emails", "send_all_emails")
+    graph.add_edge("fetch_overdue_contacts", "queue_followup_drafts")
+    graph.add_edge("queue_followup_drafts", "send_all_emails")
     graph.add_edge("send_all_emails", "generate_report")
     graph.add_edge("generate_report", END)
 
