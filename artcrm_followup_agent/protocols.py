@@ -21,7 +21,6 @@ class InboxFetcher(Protocol):
     """
     Read unprocessed incoming emails.
     Returns list of message dicts: {id, message_id, from_email, subject, body, received_at}.
-    May read from IMAP directly or from a cached inbox_messages table.
     """
     def __call__(self) -> list[dict]: ...
 
@@ -39,10 +38,10 @@ class InteractionLogger(Protocol):
     def __call__(
         self,
         contact_id: int,
-        method: str,       # email, phone, in_person, etc.
-        direction: str,    # inbound | outbound
+        method: str,
+        direction: str,
         summary: str,
-        outcome: str,      # interested, rejected, no_reply, etc.
+        outcome: str,
     ) -> None: ...
 
 
@@ -51,23 +50,22 @@ class OptOutSetter(Protocol):
     def __call__(self, contact_id: int) -> None: ...
 
 
-class InboxMessageMarker(Protocol):
-    """Mark an inbox message as processed, optionally linking it to a contact."""
-    def __call__(self, inbox_message_id: int, contact_id: int | None) -> None: ...
+class VisitFlagSetter(Protocol):
+    """Set visit_when_nearby = True on a contact. Used for warm replies."""
+    def __call__(self, contact_id: int) -> None: ...
+
+
+class InboxClassificationSaver(Protocol):
+    """Persist the LLM classification result back to the inbox_messages row."""
+    def __call__(self, inbox_message_id: int, contact_id: int | None, classification: str, reasoning: str) -> None: ...
 
 
 class OverdueFetcher(Protocol):
     """
     Return contacts that are overdue for follow-up.
-    A contact is overdue if next_action_date is in the past,
-    or if they were contacted more than `days` ago with no reply.
+    A contact is overdue if they were contacted more than `days` ago with no reply.
     """
     def __call__(self, days: int = 90) -> list[dict]: ...
-
-
-class EmailSender(Protocol):
-    """Send an email. Returns True on success, False on failure."""
-    def __call__(self, to_email: str, subject: str, body: str) -> bool: ...
 
 
 class ApprovalQueuer(Protocol):
