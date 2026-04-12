@@ -1,11 +1,45 @@
+import logging
+import re
 from langchain_core.messages import SystemMessage, HumanMessage
+
+logger = logging.getLogger(__name__)
 from langgraph.graph import StateGraph, END
 
 from .protocols import (
     AgentMission, LanguageModel, InboxFetcher, ContactMatcher,
-    InteractionLogger, OptOutSetter, VisitFlagSetter, InboxClassificationSaver,
-    OverdueFetcher, ApprovalQueuer, RunStarter, RunFinisher,
+    InteractionLogger, OptOutSetter, BounceHandler, VisitFlagSetter,
+    InboxClassificationSaver, OverdueFetcher, ApprovalQueuer, RunStarter, RunFinisher,
+    WarmOutcomeRecorder,
 )
+
+# Patterns that indicate a delivery failure notification.
+_BOUNCE_SENDERS = re.compile(
+    r"(mailer-daemon|postmaster|delivery.notification|"
+    r"mail-daemon|noreply\+bounce|mailerdaemon)",
+    re.IGNORECASE,
+)
+_BOUNCE_SUBJECTS = re.compile(
+    r"(undelivered mail|delivery (status notification|failed|failure)|"
+    r"returned mail|failure notice|mail delivery failed|"
+    r"unzustellbar|zustellungs(fehler|benachrichtigung)|"
+    r"nicht zugestellt)",
+    re.IGNORECASE,
+)
+_EMAIL_RE = re.compile(r"[\w.+\-]+@[\w.\-]+\.[a-z]{2,}", re.IGNORECASE)
+
+
+def _is_bounce(msg: dict) -> bool:
+    """Return True if the message looks like a delivery failure notification."""
+    return bool(
+        _BOUNCE_SENDERS.search(msg.get("from_email", ""))
+        or _BOUNCE_SUBJECTS.search(msg.get("subject", ""))
+    )
+
+
+def _extract_recipient_emails(msg: dict) -> list[str]:
+    """Extract all email addresses from the bounce body — one is likely the failed recipient."""
+    body = msg.get("body", "")
+    return list(dict.fromkeys(_EMAIL_RE.findall(body)))  # deduplicated, order preserved
 from .state import FollowupState
 from .prompts import (
     classify_reply_prompt, draft_interested_reply_prompt,
@@ -27,6 +61,8 @@ def create_followup_agent(
     match_contact: ContactMatcher,
     log_interaction: InteractionLogger,
     set_opt_out: OptOutSetter,
+    handle_bounce: BounceHandler,
+    record_warm_outcome: WarmOutcomeRecorder,
     set_visit_when_nearby: VisitFlagSetter,
     save_inbox_classification: InboxClassificationSaver,
     fetch_overdue: OverdueFetcher,
@@ -59,6 +95,7 @@ def create_followup_agent(
             "queued_count": 0,
             "opt_out_count": 0,
             "warm_count": 0,
+            "bounce_count": 0,
             "summary": "",
         }
 
@@ -86,8 +123,47 @@ def create_followup_agent(
         queued = state.get("queued_count", 0)
         opt_out_count = 0
         warm_count = 0
+        bounce_count = 0
 
         for msg in state.get("inbox_messages", []):
+
+            # ── Bounce detection — no LLM needed ─────────────────────────────
+            if _is_bounce(msg):
+                # Extract emails from bounce body, try to match a known contact
+                candidate_emails = _extract_recipient_emails(msg)
+                bounced_contact = None
+                for email in candidate_emails:
+                    try:
+                        c = match_contact(email)
+                        if c and c.get("status") in POST_OUTREACH_STATUSES:
+                            bounced_contact = c
+                            break
+                    except Exception:
+                        pass
+
+                if bounced_contact:
+                    try:
+                        handle_bounce(bounced_contact["id"])
+                        bounce_count += 1
+                    except Exception as e:
+                        pass
+                    try:
+                        save_inbox_classification(
+                            msg["id"], bounced_contact["id"], "bounce",
+                            f"Delivery failure for {bounced_contact.get('email', '')}",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Bounce but no matching contact found — just mark it processed
+                    try:
+                        save_inbox_classification(
+                            msg["id"], None, "bounce", "No matching contact found in bounce body",
+                        )
+                    except Exception:
+                        pass
+                continue  # skip LLM classification for bounces
+            # ─────────────────────────────────────────────────────────────────
             contact = None
             try:
                 contact = match_contact(msg["from_email"])
@@ -171,6 +247,13 @@ def create_followup_agent(
             except Exception:
                 pass
 
+            # Record warm signal for outreach quality loop
+            if classification in ("interested", "warm"):
+                try:
+                    record_warm_outcome(contact["id"])
+                except Exception as e:
+                    logger.warning("record_warm_outcome failed: contact_id=%s error=%s", contact.get("id"), e)
+
             # Draft a reply for interested and warm contacts — queue for approval
             if classification in ("interested", "warm") and contact.get("email"):
                 language = contact.get("preferred_language") or mission.language_default
@@ -205,6 +288,7 @@ def create_followup_agent(
             "queued_count": queued,
             "opt_out_count": opt_out_count,
             "warm_count": warm_count,
+            "bounce_count": bounce_count,
         }
 
     def fetch_overdue_contacts(state: FollowupState) -> dict:
@@ -245,6 +329,7 @@ def create_followup_agent(
         queued = state.get("queued_count", 0)
         opt_outs = state.get("opt_out_count", 0)
         warm = state.get("warm_count", 0)
+        bounces = state.get("bounce_count", 0)
         errs = state.get("errors", [])
 
         summary = (
@@ -252,7 +337,8 @@ def create_followup_agent(
             f"{overdue_count} overdue contacts, "
             f"{queued} drafts queued for approval, "
             f"{warm} warm replies flagged for visit, "
-            f"{opt_outs} opt-outs recorded"
+            f"{opt_outs} opt-outs recorded, "
+            f"{bounces} bounces marked as bad_email"
         )
         if errs:
             summary += f", {len(errs)} error(s)"
@@ -267,6 +353,7 @@ def create_followup_agent(
                 "queued": queued,
                 "warm": warm,
                 "opt_outs": opt_outs,
+                "bounces": bounces,
             },
         )
         return {"summary": summary}

@@ -50,6 +50,14 @@ class OptOutSetter(Protocol):
     def __call__(self, contact_id: int) -> None: ...
 
 
+class BounceHandler(Protocol):
+    """
+    Mark a contact's email as undeliverable (bad_email) and log a bounce interaction.
+    Called when a delivery failure notification is detected in the inbox.
+    """
+    def __call__(self, contact_id: int) -> None: ...
+
+
 class VisitFlagSetter(Protocol):
     """Set visit_when_nearby = True on a contact. Used for warm replies."""
     def __call__(self, contact_id: int) -> None: ...
@@ -71,6 +79,11 @@ class OverdueFetcher(Protocol):
 class ApprovalQueuer(Protocol):
     """Insert a drafted email into the approval queue. Returns queue item id."""
     def __call__(self, contact_id: int, run_id: int, subject: str, body: str) -> int: ...
+
+
+class WarmOutcomeRecorder(Protocol):
+    """Record that a contact sent a warm or interested reply. Used for outreach quality analysis."""
+    def __call__(self, contact_id: int) -> None: ...
 
 
 class RunStarter(Protocol):
