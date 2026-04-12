@@ -236,6 +236,7 @@ def create_followup_agent(
                 "opt_out":       "opt_out",
                 "other":         "no_reply",
             }
+            interaction_logged = False
             try:
                 log_interaction(
                     contact_id=contact["id"],
@@ -244,11 +245,12 @@ def create_followup_agent(
                     summary=f"{classification}: {msg.get('subject', '')}",
                     outcome=outcome_map.get(classification, "no_reply"),
                 )
-            except Exception:
-                pass
+                interaction_logged = True
+            except Exception as e:
+                logger.warning("log_interaction failed: contact_id=%s error=%s", contact.get("id"), e)
 
-            # Record warm signal for outreach quality loop
-            if classification in ("interested", "warm"):
+            # Record warm signal for outreach quality loop — only if interaction was committed
+            if interaction_logged and classification in ("interested", "warm"):
                 try:
                     record_warm_outcome(contact["id"])
                 except Exception as e:
