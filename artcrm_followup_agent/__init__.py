@@ -1,7 +1,8 @@
 from .graph import create_followup_agent
 from .protocols import (
     AgentMission, LanguageModel, InboxFetcher, ContactMatcher,
-    InteractionLogger, OptOutSetter, VisitFlagSetter, InboxClassificationSaver,
+    InteractionLogger, OptOutSetter, BounceHandler, WarmOutcomeRecorder,
+    VisitFlagSetter, InboxClassificationSaver,
     OverdueFetcher, ApprovalQueuer, RunStarter, RunFinisher,
 )
 from .state import FollowupState
@@ -14,6 +15,8 @@ __all__ = [
     "ContactMatcher",
     "InteractionLogger",
     "OptOutSetter",
+    "BounceHandler",
+    "WarmOutcomeRecorder",
     "VisitFlagSetter",
     "InboxClassificationSaver",
     "OverdueFetcher",

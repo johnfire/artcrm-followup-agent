@@ -2,9 +2,8 @@
 name = "artcrm-followup-agent"
 version = "0.1.0"
 requires-python = ">=3.11"
-description = "LangGraph agent that reads inbox replies, classifies them, and sends follow-ups to overdue contacts."
+description = "Followup agent that reads inbox replies, classifies them, and queues follow-ups for overdue contacts."
 dependencies = [
-    "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
 ]
 
@@ -22,3 +21,8 @@ packages = ["artcrm_followup_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
