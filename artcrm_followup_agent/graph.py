@@ -186,14 +186,14 @@ class _FollowupAgent:
             contact = None
             try:
                 contact = self._match_contact(msg["from_email"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: match_contact failed for %s: %s", msg.get("from_email"), e)
 
             if contact is None:
                 try:
                     self._save_inbox_classification(msg["id"], None, "skipped", "no matching contact")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
                 continue
 
             if contact.get("status") not in POST_OUTREACH_STATUSES:
@@ -202,8 +202,8 @@ class _FollowupAgent:
                         msg["id"], contact["id"], "skipped",
                         f"contact status '{contact.get('status')}' is pre-outreach",
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
                 continue
 
             classification, reasoning = self._classify_message(msg)
@@ -271,8 +271,8 @@ class _FollowupAgent:
 
             try:
                 self._save_inbox_classification(msg["id"], contact["id"], classification, reasoning)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
 
             classified.append(entry)
 
@@ -308,29 +308,29 @@ class _FollowupAgent:
                 if c and c.get("status") in POST_OUTREACH_STATUSES:
                     bounced_contact = c
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: match_contact failed for bounce %s: %s", email, e)
 
         if bounced_contact:
             try:
                 self._handle_bounce(bounced_contact["id"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: handle_bounce failed for contact %s: %s", bounced_contact.get("id"), e)
             try:
                 self._save_inbox_classification(
                     msg["id"], bounced_contact["id"], "bounce",
                     f"Delivery failure for {bounced_contact.get('email', '')}",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
             return 1
         else:
             try:
                 self._save_inbox_classification(
                     msg["id"], None, "bounce", "No matching contact found in bounce body",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
             return 0
 
     def _queue_followup_drafts(
@@ -353,8 +353,8 @@ class _FollowupAgent:
                     body=draft.get("body", ""),
                 )
                 queued_count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("followup: failed to queue followup draft for contact %s: %s", contact.get("id"), e)
         return queued_count
 
 
