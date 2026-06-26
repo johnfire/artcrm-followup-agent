@@ -13,6 +13,7 @@ Pipeline position: research → enrich → scout → outreach → followup
 """
 import logging
 import re
+from dataclasses import dataclass
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -59,6 +60,15 @@ _OUTCOME_MAP = {
     "opt_out":        "opt_out",
     "other":          "no_reply",
 }
+
+
+@dataclass
+class _ReplyTotals:
+    """Side-effect counters accumulated while classifying inbox replies (L-3)."""
+    queued: int = 0
+    opt_outs: int = 0
+    warm: int = 0
+    bounces: int = 0
 
 
 def _is_bounce(msg: dict) -> bool:
@@ -113,12 +123,10 @@ class _FollowupAgent:
         errors = []
 
         inbox_messages = self._fetch_inbox_messages(errors)
-        classified_replies, queued_count, opt_out_count, warm_count, bounce_count = self._classify_replies(
-            inbox_messages, run_id
-        )
+        classified_replies, totals = self._classify_replies(inbox_messages, run_id)
 
         overdue_contacts = self._fetch_overdue_contacts(errors)
-        queued_count = self._queue_followup_drafts(overdue_contacts, run_id, queued_count)
+        queued_count = self._queue_followup_drafts(overdue_contacts, run_id, totals.queued)
 
         inbox_count = len(classified_replies)
         overdue_count = len(overdue_contacts)
@@ -126,9 +134,9 @@ class _FollowupAgent:
             f"followup_agent: {inbox_count} replies processed, "
             f"{overdue_count} overdue contacts, "
             f"{queued_count} drafts queued for approval, "
-            f"{warm_count} warm replies flagged for visit, "
-            f"{opt_out_count} opt-outs recorded, "
-            f"{bounce_count} bounces marked as bad_email"
+            f"{totals.warm} warm replies flagged for visit, "
+            f"{totals.opt_outs} opt-outs recorded, "
+            f"{totals.bounces} bounces marked as bad_email"
         )
         if errors:
             summary += f", {len(errors)} error(s)"
@@ -139,18 +147,18 @@ class _FollowupAgent:
                 "inbox_processed": inbox_count,
                 "overdue_handled": overdue_count,
                 "queued": queued_count,
-                "warm": warm_count,
-                "opt_outs": opt_out_count,
-                "bounces": bounce_count,
+                "warm": totals.warm,
+                "opt_outs": totals.opt_outs,
+                "bounces": totals.bounces,
             },
         )
         logger.info(summary)
         return {
             "summary": summary,
             "queued_count": queued_count,
-            "opt_out_count": opt_out_count,
-            "warm_count": warm_count,
-            "bounce_count": bounce_count,
+            "opt_out_count": totals.opt_outs,
+            "warm_count": totals.warm,
+            "bounce_count": totals.bounces,
         }
 
     def _fetch_inbox_messages(self, errors: list) -> list[dict]:
@@ -169,113 +177,130 @@ class _FollowupAgent:
 
     def _classify_replies(
         self, inbox_messages: list[dict], run_id: int
-    ) -> tuple[list[dict], int, int, int, int]:
-        """Classify each inbox message. Returns (classified, queued, opt_outs, warm, bounces)."""
+    ) -> tuple[list[dict], _ReplyTotals]:
+        """Classify each inbox message, accumulating side-effect counts in `_ReplyTotals`.
+
+        Returns the per-message classification entries and the aggregate totals.
+        """
+        totals = _ReplyTotals()
         classified = []
-        queued = 0
-        opt_out_count = 0
-        warm_count = 0
-        bounce_count = 0
-
         for msg in inbox_messages:
-            if _is_bounce(msg):
-                bounce_count += self._handle_bounce_message(msg)
-                continue
+            entry = self._classify_one_reply(msg, run_id, totals)
+            if entry is not None:
+                classified.append(entry)
+        return classified, totals
 
-            contact = None
+    def _classify_one_reply(self, msg: dict, run_id: int, totals: _ReplyTotals) -> dict | None:
+        """Handle a single inbox message; mutates `totals`. Returns its classification
+        entry, or None when the message is a bounce or is skipped (no entry recorded)."""
+        if _is_bounce(msg):
+            totals.bounces += self._handle_bounce_message(msg)
+            return None
+
+        contact = None
+        try:
+            contact = self._match_contact(msg["from_email"])
+        except Exception as e:
+            logger.warning("followup: match_contact failed for %s: %s", msg.get("from_email"), e)
+
+        if contact is None:
+            self._save_classification(msg["id"], None, "skipped", "no matching contact")
+            return None
+
+        if contact.get("status") not in POST_OUTREACH_STATUSES:
+            self._save_classification(
+                msg["id"], contact["id"], "skipped",
+                f"contact status '{contact.get('status')}' is pre-outreach",
+            )
+            return None
+
+        classification, reasoning = self._classify_message(msg)
+        entry = {
+            "inbox_message_id": msg["id"],
+            "contact_id": contact["id"],
+            "from_email": msg["from_email"],
+            "classification": classification,
+            "reasoning": reasoning,
+        }
+
+        self._apply_reply_side_effects(msg, contact, classification, run_id, totals, entry)
+
+        self._save_classification(msg["id"], contact["id"], classification, reasoning)
+        return entry
+
+    def _apply_reply_side_effects(
+        self, msg: dict, contact: dict, classification: str,
+        run_id: int, totals: _ReplyTotals, entry: dict,
+    ) -> None:
+        """Run the DB side-effects gated by a reply's classification, recording counts
+        on `totals` and outcomes/errors on `entry`."""
+        if classification == "opt_out":
             try:
-                contact = self._match_contact(msg["from_email"])
+                self._set_opt_out(contact["id"])
+                totals.opt_outs += 1
             except Exception as e:
-                logger.warning("followup: match_contact failed for %s: %s", msg.get("from_email"), e)
+                entry["error"] = f"set_opt_out: {e}"
 
-            if contact is None:
-                try:
-                    self._save_inbox_classification(msg["id"], None, "skipped", "no matching contact")
-                except Exception as e:
-                    logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
-                continue
-
-            if contact.get("status") not in POST_OUTREACH_STATUSES:
-                try:
-                    self._save_inbox_classification(
-                        msg["id"], contact["id"], "skipped",
-                        f"contact status '{contact.get('status')}' is pre-outreach",
-                    )
-                except Exception as e:
-                    logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
-                continue
-
-            classification, reasoning = self._classify_message(msg)
-            entry = {
-                "inbox_message_id": msg["id"],
-                "contact_id": contact["id"],
-                "from_email": msg["from_email"],
-                "classification": classification,
-                "reasoning": reasoning,
-            }
-
-            if classification == "opt_out":
-                try:
-                    self._set_opt_out(contact["id"])
-                    opt_out_count += 1
-                except Exception as e:
-                    entry["error"] = f"set_opt_out: {e}"
-
-            if classification == "warm":
-                try:
-                    self._set_visit_when_nearby(contact["id"])
-                    warm_count += 1
-                    entry["visit_flagged"] = True
-                except Exception as e:
-                    entry["error"] = f"set_visit_when_nearby: {e}"
-
-            interaction_logged = False
+        if classification == "warm":
             try:
-                self._log_interaction(
-                    contact_id=contact["id"],
-                    method="email",
-                    direction="inbound",
-                    summary=f"{classification}: {msg.get('subject', '')}",
-                    outcome=_OUTCOME_MAP.get(classification, "no_reply"),
-                )
-                interaction_logged = True
+                self._set_visit_when_nearby(contact["id"])
+                totals.warm += 1
+                entry["visit_flagged"] = True
             except Exception as e:
-                logger.warning("log_interaction failed: contact_id=%s error=%s", contact.get("id"), e)
+                entry["error"] = f"set_visit_when_nearby: {e}"
 
-            if interaction_logged and classification in ("interested", "warm"):
-                try:
-                    self._record_warm_outcome(contact["id"])
-                except Exception as e:
-                    logger.warning("record_warm_outcome failed: contact_id=%s error=%s", contact.get("id"), e)
+        interaction_logged = False
+        try:
+            self._log_interaction(
+                contact_id=contact["id"],
+                method="email",
+                direction="inbound",
+                summary=f"{classification}: {msg.get('subject', '')}",
+                outcome=_OUTCOME_MAP.get(classification, "no_reply"),
+            )
+            interaction_logged = True
+        except Exception as e:
+            logger.warning("log_interaction failed: contact_id=%s error=%s", contact.get("id"), e)
 
-            if classification in ("interested", "warm") and contact.get("email"):
-                language = contact.get("preferred_language") or self._mission.language_default
-                if classification == "interested":
-                    sys_p, usr_p = draft_interested_reply_prompt(self._mission, contact, msg, language)
-                else:
-                    sys_p, usr_p = draft_warm_reply_prompt(self._mission, contact, msg, language)
-                try:
-                    draft_resp = self._llm.invoke([SystemMessage(content=sys_p), HumanMessage(content=usr_p)])
-                    draft = parse_json_response(draft_resp.content)
-                    self._queue_for_approval(
-                        contact_id=contact["id"],
-                        run_id=run_id,
-                        subject=draft.get("subject", ""),
-                        body=draft.get("body", ""),
-                    )
-                    queued += 1
-                    entry["reply_queued"] = True
-                except Exception as e:
-                    entry["draft_error"] = str(e)
-
+        if interaction_logged and classification in ("interested", "warm"):
             try:
-                self._save_inbox_classification(msg["id"], contact["id"], classification, reasoning)
+                self._record_warm_outcome(contact["id"])
             except Exception as e:
-                logger.warning("followup: save_inbox_classification failed for msg %s: %s", msg.get("id"), e)
+                logger.warning("record_warm_outcome failed: contact_id=%s error=%s", contact.get("id"), e)
 
-            classified.append(entry)
+        if classification in ("interested", "warm") and contact.get("email"):
+            self._draft_and_queue_reply(msg, contact, classification, run_id, totals, entry)
 
-        return classified, queued, opt_out_count, warm_count, bounce_count
+    def _draft_and_queue_reply(
+        self, msg: dict, contact: dict, classification: str,
+        run_id: int, totals: _ReplyTotals, entry: dict,
+    ) -> None:
+        """Draft an interested/warm reply via the LLM and queue it for human approval."""
+        language = contact.get("preferred_language") or self._mission.language_default
+        if classification == "interested":
+            sys_p, usr_p = draft_interested_reply_prompt(self._mission, contact, msg, language)
+        else:
+            sys_p, usr_p = draft_warm_reply_prompt(self._mission, contact, msg, language)
+        try:
+            draft_resp = self._llm.invoke([SystemMessage(content=sys_p), HumanMessage(content=usr_p)])
+            draft = parse_json_response(draft_resp.content)
+            self._queue_for_approval(
+                contact_id=contact["id"],
+                run_id=run_id,
+                subject=draft.get("subject", ""),
+                body=draft.get("body", ""),
+            )
+            totals.queued += 1
+            entry["reply_queued"] = True
+        except Exception as e:
+            entry["draft_error"] = str(e)
+
+    def _save_classification(self, message_id, contact_id, classification: str, reasoning: str) -> None:
+        """Persist an inbox classification, logging (not raising) on failure."""
+        try:
+            self._save_inbox_classification(message_id, contact_id, classification, reasoning)
+        except Exception as e:
+            logger.warning("followup: save_inbox_classification failed for msg %s: %s", message_id, e)
 
     def _classify_message(self, msg: dict) -> tuple[str, str]:
         """Ask the LLM to classify an inbox reply. Returns (classification, reasoning).
