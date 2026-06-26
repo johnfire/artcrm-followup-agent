@@ -26,6 +26,7 @@ from .state import FollowupState
 from .prompts import (
     classify_reply_prompt, draft_interested_reply_prompt,
     draft_warm_reply_prompt, draft_followup_prompt,
+    REPLY_CLASSIFICATIONS,
 )
 from ._utils import parse_json_response
 
@@ -278,12 +279,22 @@ class _FollowupAgent:
         return classified, queued, opt_out_count, warm_count, bounce_count
 
     def _classify_message(self, msg: dict) -> tuple[str, str]:
-        """Ask the LLM to classify an inbox reply. Returns (classification, reasoning)."""
+        """Ask the LLM to classify an inbox reply. Returns (classification, reasoning).
+
+        The classification gates unattended DB side-effects (opt_out / visit flags), so
+        any value not in the strict enum is coerced to "other" (no side-effects). This,
+        with the delimiter fencing in the prompt, blocks prompt-injection from the
+        untrusted email body flipping a CRM decision (H-3).
+        """
         system, user = classify_reply_prompt(self._mission, msg)
         try:
             response = self._llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
             result = parse_json_response(response.content)
-            return result.get("classification", "other"), result.get("reasoning", "")
+            classification = result.get("classification", "other")
+            if classification not in REPLY_CLASSIFICATIONS:
+                logger.warning("followup: off-enum classification %r coerced to 'other'", classification)
+                classification = "other"
+            return classification, result.get("reasoning", "")
         except Exception as e:
             return "other", f"classification error: {e}"
 
