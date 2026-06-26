@@ -22,7 +22,6 @@ from .protocols import (
     InboxClassificationSaver, OverdueFetcher, ApprovalQueuer, RunStarter, RunFinisher,
     WarmOutcomeRecorder,
 )
-from .state import FollowupState
 from .prompts import (
     classify_reply_prompt, draft_interested_reply_prompt,
     draft_warm_reply_prompt, draft_followup_prompt,
